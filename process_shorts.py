@@ -10,7 +10,6 @@ import cv2
 import numpy as np
 from pathlib import Path
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # PyTorch/EasyOCR CPU warnings suppress karne ke liye
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -49,7 +48,7 @@ def get_duration(video_path: str) -> float:
 
 
 # ==========================================
-# STEP 1: REMOVE AUTO-CAPTIONS
+# STEP 1: ZERO-LEAK AUTO-CAPTION REMOVAL
 # ==========================================
 def remove_shorts_captions(input_video: str, output_video: str):
     if not REMOVE_BURNED_CAPTIONS:
@@ -63,33 +62,66 @@ def remove_shorts_captions(input_video: str, output_video: str):
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    y_start, y_end = int(h * 0.25), int(h * 0.90)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    temp_silent = f"temp_silent_{int(time.time())}.mp4"
-    out = cv2.VideoWriter(temp_silent, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    # Top se bottom tak lagbhag poora screen scan (8% to 96%)
+    y_start, y_end = int(h * 0.08), int(h * 0.96)
 
+    # PASS 1: Har 2nd frame par OCR chala kar saare text boxes collect karein
+    print(f"    -> Pass 1/2: Scanning {total_frames} frames for captions...", flush=True)
+    detected_boxes = {}  # frame_idx -> list of polygon points
     frame_idx = 0
-    last_mask = None
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        if frame_idx % 6 == 0:
+        if frame_idx % 2 == 0:
             roi = frame[y_start:y_end, 0:w]
+            # Confidence threshold 0.15 rakha hai taaki stylish/faint captions bhi catch hon
             results = OCR_READER.readtext(roi)
-            mask = np.zeros((h, w), dtype=np.uint8)
+            boxes = []
             for (bbox, text, conf) in results:
-                if conf > 0.30:
+                if conf > 0.15:
                     pts = np.array(bbox, dtype=np.int32)
                     pts[:, 1] += y_start
-                    cv2.fillPoly(mask, [pts], 255)
-            kernel = np.ones((11, 11), np.uint8)
-            last_mask = cv2.dilate(mask, kernel, iterations=1)
+                    boxes.append(pts)
+            if boxes:
+                detected_boxes[frame_idx] = boxes
 
-        if last_mask is not None and np.any(last_mask):
-            frame = cv2.inpaint(frame, last_mask, 5, cv2.INPAINT_TELEA)
+        frame_idx += 1
+
+    cap.release()
+
+    # PASS 2: Temporal Buffer (±3 frames) + Heavy Dilation ke saath inpaint karein
+    print("    -> Pass 2/2: Removing captions with temporal buffer...", flush=True)
+    cap = cv2.VideoCapture(input_video)
+    temp_silent = f"temp_silent_{int(time.time())}.mp4"
+    out = cv2.VideoWriter(temp_silent, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+
+    kernel = np.ones((21, 21), np.uint8)
+    frame_idx = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Current frame ke aage-peeche 3 frames ke saare text boxes merge karein
+        mask = np.zeros((h, w), dtype=np.uint8)
+        has_text = False
+        for offset in range(-3, 4):
+            boxes = detected_boxes.get(frame_idx + offset)
+            if boxes:
+                has_text = True
+                for pts in boxes:
+                    cv2.fillPoly(mask, [pts], 255)
+
+        if has_text:
+            # 2 iterations dilation taaki text ka shadow/outline bilkul na bache
+            mask = cv2.dilate(mask, kernel, iterations=2)
+            frame = cv2.inpaint(frame, mask, 7, cv2.INPAINT_TELEA)
 
         out.write(frame)
         frame_idx += 1
@@ -170,7 +202,8 @@ def alter_fingerprint_and_pixels(input_video: str, output_video: str):
 
 
 # ==========================================
-# STEP 4: 12 SERVERS PARALLEL UPLOADER
+# STEP 4: 12 SERVERS FALLBACK UPLOADER
+# (Ek fail hoga tabhi dusra try karega)
 # ==========================================
 HEADERS = {"User-Agent": "Mozilla/5.0 (ShortsAutoBot/1.0)"}
 
@@ -265,33 +298,38 @@ SERVERS = [
 ]
 
 
-def upload_all_parallel(video_path: str) -> dict:
-    results = {}
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        future_map = {executor.submit(fn, video_path): name for name, fn in SERVERS}
-        for fut in as_completed(future_map):
-            name = future_map[fut]
-            try:
-                url = fut.result()
-                results[name] = url
-                print(f"  [OK] {name}: {url}")
-            except Exception as e:
-                results[name] = "FAILED"
-                print(f"  [FAIL] {name}: {e}")
-    return results
+def upload_with_fallback(video_path: str):
+    """
+    Servers ko ek-ek karke try karega.
+    Jaise hi koi 1 server valid link dega, wahin stop ho jayega.
+    """
+    for name, func in SERVERS:
+        try:
+            print(f"    -> Trying {name}...", flush=True)
+            url = func(video_path)
+            if url and url.startswith("http"):
+                print(f"    [SUCCESS] {name}: {url}", flush=True)
+                return name, url
+            else:
+                print(f"    [FAIL] {name}: Invalid response ({url})", flush=True)
+        except Exception as e:
+            print(f"    [FAIL] {name}: {e}", flush=True)
+    return "ALL_FAILED", "FAILED"
 
 
-def save_links_to_csv(filename: str, links: dict):
+def save_link_to_csv(filename: str, server_name: str, direct_link: str):
     file_exists = LINKS_CSV.exists()
-    headers = ["Timestamp", "Video_File"] + [name for name, _ in SERVERS]
+    headers = ["Timestamp", "Video_File", "Server_Used", "Direct_Link"]
     with open(LINKS_CSV, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow(headers)
-        row = [datetime.now().strftime("%Y-%m-%d %H:%M:%S"), filename] + [
-            links.get(name, "FAILED") for name, _ in SERVERS
-        ]
-        writer.writerow(row)
+        writer.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            filename,
+            server_name,
+            direct_link
+        ])
 
 
 # ==========================================
@@ -303,7 +341,7 @@ def process_all_videos():
         if p.is_file() and p.suffix.lower() in VIDEO_EXTS
     ]
     if not videos:
-        print("No valid video files found in videos/. Exiting.")
+        print("No valid video files found in videos/. Exiting.", flush=True)
         return
 
     for video_file in videos:
@@ -318,7 +356,7 @@ def process_all_videos():
             step2 = str(PROCESSED_DIR / f"s2_{video_file.stem}.mp4")
             final_out = str(PROCESSED_DIR / f"final_{video_file.stem}.mp4")
 
-            print("  [1/4] Removing auto-captions...", flush=True)
+            print("  [1/4] Removing auto-captions (Zero-Leak 2-Pass)...", flush=True)
             remove_shorts_captions(str(video_file), step1)
 
             print(f"  [2/4] Removing background voiceover/noise ({AUDIO_MODE})...", flush=True)
@@ -327,16 +365,16 @@ def process_all_videos():
             print("  [3/4] Changing video fingerprint & pixels...", flush=True)
             alter_fingerprint_and_pixels(step2, final_out)
 
-            print("  [4/4] Uploading to 12 servers...", flush=True)
-            links = upload_all_parallel(final_out)
-            save_links_to_csv(video_file.name, links)
+            print("  [4/4] Uploading with 12-server fallback...", flush=True)
+            server_name, direct_link = upload_with_fallback(final_out)
+            save_link_to_csv(video_file.name, server_name, direct_link)
 
             for tmp in (step1, step2):
                 if os.path.exists(tmp):
                     os.remove(tmp)
 
             shutil.move(str(video_file), str(DONE_DIR / video_file.name))
-            print(f"<<< DONE: {video_file.name}", flush=True)
+            print(f"<<< DONE: {video_file.name} | {server_name} -> {direct_link}", flush=True)
 
         except Exception as e:
             print(f"[ERROR] Failed on {video_file.name}: {e}", flush=True)
