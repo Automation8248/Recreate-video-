@@ -41,7 +41,9 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run Shorts Automation Pipeline
-        run: python process_shorts.py
+        env:
+          PYTHONWARNINGS: "ignore::UserWarning"
+        run: python -u process_shorts.py
 
       - name: Commit output_links.csv & Move Done Videos
         run: |
