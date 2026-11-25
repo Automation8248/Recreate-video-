@@ -1,0 +1,8 @@
+requests
+opencv-python-headless
+numpy
+easyocr
+deepfilternet
+demucs
+torch
+torchaudio
