@@ -3,6 +3,7 @@ import csv
 import time
 import random
 import shutil
+import warnings
 import subprocess
 import requests
 import cv2
@@ -10,6 +11,9 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# PyTorch/EasyOCR CPU warnings suppress karne ke liye
+warnings.filterwarnings("ignore", category=UserWarning)
 
 # ==========================================
 # CONFIGURATION
@@ -30,7 +34,7 @@ for d in (INPUT_DIR, PROCESSED_DIR, DONE_DIR):
 OCR_READER = None
 if REMOVE_BURNED_CAPTIONS:
     import easyocr
-    OCR_READER = easyocr.Reader(["en"], gpu=False)
+    OCR_READER = easyocr.Reader(["en"], gpu=False, quantize=False)
 
 
 # ==========================================
@@ -294,7 +298,6 @@ def save_links_to_csv(filename: str, links: dict):
 # MAIN BATCH RUNNER
 # ==========================================
 def process_all_videos():
-    # Sirf valid video extensions ko pick karega (.txt etc. ignore honge)
     videos = [
         p for p in INPUT_DIR.iterdir()
         if p.is_file() and p.suffix.lower() in VIDEO_EXTS
@@ -304,27 +307,27 @@ def process_all_videos():
         return
 
     for video_file in videos:
-        print(f"\n>>> Processing: {video_file.name}")
+        print(f"\n>>> Processing: {video_file.name}", flush=True)
         try:
             duration = get_duration(str(video_file))
             if duration > MAX_DURATION_SEC:
-                print(f"  [SKIP] {video_file.name} is {duration:.1f}s (2 min limit se zyada).")
+                print(f"  [SKIP] {video_file.name} is {duration:.1f}s (2 min limit se zyada).", flush=True)
                 continue
 
             step1 = str(PROCESSED_DIR / f"s1_{video_file.stem}.mp4")
             step2 = str(PROCESSED_DIR / f"s2_{video_file.stem}.mp4")
             final_out = str(PROCESSED_DIR / f"final_{video_file.stem}.mp4")
 
-            print("  [1/4] Removing auto-captions...")
+            print("  [1/4] Removing auto-captions...", flush=True)
             remove_shorts_captions(str(video_file), step1)
 
-            print(f"  [2/4] Removing background voiceover/noise ({AUDIO_MODE})...")
+            print(f"  [2/4] Removing background voiceover/noise ({AUDIO_MODE})...", flush=True)
             clean_audio(step1, step2)
 
-            print("  [3/4] Changing video fingerprint & pixels...")
+            print("  [3/4] Changing video fingerprint & pixels...", flush=True)
             alter_fingerprint_and_pixels(step2, final_out)
 
-            print("  [4/4] Uploading to 12 servers...")
+            print("  [4/4] Uploading to 12 servers...", flush=True)
             links = upload_all_parallel(final_out)
             save_links_to_csv(video_file.name, links)
 
@@ -333,10 +336,10 @@ def process_all_videos():
                     os.remove(tmp)
 
             shutil.move(str(video_file), str(DONE_DIR / video_file.name))
-            print(f"<<< DONE: {video_file.name}")
+            print(f"<<< DONE: {video_file.name}", flush=True)
 
         except Exception as e:
-            print(f"[ERROR] Failed on {video_file.name}: {e}")
+            print(f"[ERROR] Failed on {video_file.name}: {e}", flush=True)
 
 
 if __name__ == "__main__":
