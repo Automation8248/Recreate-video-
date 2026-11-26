@@ -1,4 +1,4 @@
-name: Shorts Auto Cleaner & 12-Server Uploader
+name: Shorts Auto Cleaner, Unique Maker & Target Repo Pusher
 
 on:
   push:
@@ -11,6 +11,8 @@ on:
       - 'videos/**/*.webm'
       - 'videos/**/*.avi'
       - 'videos/**/*.m4v'
+  schedule:
+    - cron: '0 0 * * *'   # Daily run for 30-day auto-delete check
   workflow_dispatch:
 
 permissions:
@@ -22,13 +24,16 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout Source Repository (Full History for 30-Day Check)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip'
 
       - name: Install FFmpeg
         run: |
@@ -43,20 +48,13 @@ jobs:
       - name: Run Shorts Automation Pipeline
         env:
           PYTHONWARNINGS: "ignore::UserWarning"
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: python -u process_shorts.py
 
-      - name: Commit output_links.csv & Move Done Videos
+      - name: Commit Source Repo State (Cleanup & CSV)
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add output_links.csv videos/ done_originals/
-          git diff --quiet && git diff --staged --quiet || git commit -m "Auto: Processed shorts & updated direct links"
+          git diff --quiet && git diff --staged --quiet || git commit -m "Auto: Processed shorts, updated links & 30-day cleanup"
           git push
-
-      - name: Upload Processed Videos as GitHub Artifact
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: processed-shorts
-          path: processed_videos/*.mp4
-          retention-days: 3
