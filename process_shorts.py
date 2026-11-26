@@ -1,4 +1,5 @@
 import os
+import re
 import csv
 import time
 import uuid
@@ -25,7 +26,7 @@ DONE_DIR = Path("done_originals")
 MUSIC_FILE = Path("music.txt")
 LINKS_CSV = Path("output_links.csv")
 
-# Target Repo Settings (Video file yahan save hogi)
+# Target Repo Settings (Final video file yahan save hogi)
 TARGET_REPO = "Automation8248/Postza"
 TARGET_BRANCH = "main"
 TARGET_SUBFOLDER = "Facebook Intresting Fact/Videos"
@@ -36,7 +37,7 @@ AUTO_DELETE_DAYS = 30           # 30 days baad processed videos auto-delete
 REMOVE_BURNED_CAPTIONS = True   # Zero-leak 2-pass auto-caption removal
 AUDIO_MODE = "no_vocals"        # 'no_vocals' (voiceover hataye), 'deepfilter' (bg noise hataye), 'keep_vocals' (music hataye)
 ADD_BG_MUSIC = True             # music.txt se random Drive music add karega
-BG_MUSIC_VOLUME = 0.28          # Background music volume (0.1 to 1.0)
+BG_MUSIC_VOLUME = 0.45          # Clear audible background music volume (0.1 to 1.0)
 ENABLE_SERVER_UPLOAD = True     # 12-server fallback uploader option
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 
@@ -50,7 +51,7 @@ if REMOVE_BURNED_CAPTIONS:
 
 
 # ==========================================
-# HELPER: VIDEO DURATION & STREAM CHECK
+# HELPER: VIDEO DURATION & AUDIO CHECK
 # ==========================================
 def get_duration(video_path: str) -> float:
     cmd = [
@@ -60,13 +61,16 @@ def get_duration(video_path: str) -> float:
     return float(subprocess.check_output(cmd).decode().strip())
 
 
-def has_audio_stream(video_path: str) -> bool:
-    cmd = [
-        "ffprobe", "-v", "error", "-select_streams", "a",
-        "-show_entries", "stream=index", "-of", "csv=p=0", video_path
-    ]
-    out = subprocess.check_output(cmd).decode().strip()
-    return len(out) > 0
+def has_audio_stream(media_path: str) -> bool:
+    try:
+        cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "a",
+            "-show_entries", "stream=index", "-of", "csv=p=0", media_path
+        ]
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
+        return len(out) > 0
+    except Exception:
+        return False
 
 
 # ==========================================
@@ -186,71 +190,11 @@ def clean_audio(input_video: str, output_video: str, work_dir: Path, mode: str =
 
 
 # ==========================================
-# STEP 3: RANDOM BACKGROUND MUSIC (music.txt)
-# ==========================================
-def add_random_bg_music(input_video: str, output_video: str, work_dir: Path):
-    if not ADD_BG_MUSIC or not MUSIC_FILE.exists():
-        shutil.copy(input_video, output_video)
-        return
-
-    links = [
-        line.strip() for line in MUSIC_FILE.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
-    if not links:
-        print("    [WARN] music.txt khali hai, music skip kar rahe hain.", flush=True)
-        shutil.copy(input_video, output_video)
-        return
-
-    chosen_url = random.choice(links)
-    music_path = str(work_dir / f"bg_music_{int(time.time())}.mp3")
-    print(f"    -> Downloading random music from Drive: {chosen_url}", flush=True)
-
-    try:
-        downloaded = gdown.download(chosen_url, music_path, quiet=True, fuzzy=True)
-        if not downloaded or not os.path.exists(music_path) or os.path.getsize(music_path) < 1000:
-            raise RuntimeError("Music download failed or file too small")
-    except Exception as e:
-        print(f"    [WARN] Music download fail hua ({e}), original audio rakh rahe hain.", flush=True)
-        shutil.copy(input_video, output_video)
-        return
-
-    # Video ke saath background music merge karein
-    if has_audio_stream(input_video):
-        filter_complex = (
-            f"[0:a]volume=0.85[a0];"
-            f"[1:a]volume={BG_MUSIC_VOLUME}[a1];"
-            f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[aout]"
-        )
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", input_video,
-            "-stream_loop", "-1", "-i", music_path,
-            "-filter_complex", filter_complex,
-            "-map", "0:v:0", "-map", "[aout]",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-            "-shortest", output_video
-        ]
-    else:
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", input_video,
-            "-stream_loop", "-1", "-i", music_path,
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-            "-shortest", output_video
-        ]
-
-    subprocess.run(cmd, check=True)
-
-
-# ==========================================
-# STEP 4: DEEP UNIQUENESS (METADATA, HASH, FINGERPRINT, PIXELS, AUDIO)
+# STEP 3: DEEP UNIQUENESS (METADATA, HASH, FINGERPRINT, PIXELS, AUDIO)
 # ==========================================
 def make_video_fully_unique(input_video: str, output_video: str):
-    # Subtle visual & pixel variations (human eye ko natural lagega, hash/pHash 100% badal jayega)
     zoom = round(random.uniform(1.015, 1.030), 4)
-    angle_rad = round(random.uniform(-0.005, 0.005), 4)  # ~0.3 degree micro-tilt
+    angle_rad = round(random.uniform(-0.005, 0.005), 4)
     brightness = round(random.uniform(-0.025, 0.025), 3)
     contrast = round(random.uniform(0.97, 1.04), 3)
     saturation = round(random.uniform(0.97, 1.05), 3)
@@ -261,11 +205,6 @@ def make_video_fully_unique(input_video: str, output_video: str):
     pts_factor = round(1.0 / speed, 5)
     crf_val = str(random.choice([20, 21, 22]))
 
-    # Subtle audio pitch & EQ variation (audio fingerprint change)
-    pitch = round(random.uniform(0.985, 1.015), 4)
-    tempo_adj = round(speed / pitch, 4)
-    bass_gain = round(random.uniform(-1.2, 1.5), 2)
-
     vf_chain = (
         f"scale=iw*{zoom}:ih*{zoom},"
         f"rotate={angle_rad}:fillcolor=black@0,"
@@ -275,22 +214,27 @@ def make_video_fully_unique(input_video: str, output_video: str):
         f"noise=alls={noise_str}:allf=t+u,"
         f"setpts={pts_factor}*PTS"
     )
-    af_chain = (
-        f"asetrate=48000*{pitch},aresample=48000,"
-        f"atempo={tempo_adj},"
-        f"bass=g={bass_gain}"
-    )
 
-    # Fresh unique metadata (purana metadata wipe + naya realistic metadata inject)
+    cmd = ["ffmpeg", "-y", "-i", input_video, "-vf", vf_chain]
+
+    if has_audio_stream(input_video):
+        pitch = round(random.uniform(0.985, 1.015), 4)
+        tempo_adj = round(speed / pitch, 4)
+        bass_gain = round(random.uniform(-1.2, 1.5), 2)
+        af_chain = (
+            f"asetrate=48000*{pitch},aresample=48000,"
+            f"atempo={tempo_adj},"
+            f"bass=g={bass_gain}"
+        )
+        cmd += ["-af", af_chain, "-c:a", "aac", "-b:a", "192k"]
+    else:
+        cmd += ["-an"]
+
     unique_id = uuid.uuid4().hex[:12]
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
-    encoders = ["Apple iPhone 15 Pro", "Samsung Galaxy S24", "Google Pixel 9", "Sony Alpha ZV-E10"]
-    chosen_encoder = random.choice(encoders)
+    chosen_encoder = random.choice(["Apple iPhone 15 Pro", "Samsung Galaxy S24", "Google Pixel 9", "Sony Alpha ZV-E10"])
 
-    cmd = [
-        "ffmpeg", "-y", "-i", input_video,
-        "-vf", vf_chain,
-        "-af", af_chain,
+    cmd += [
         "-map_metadata", "-1",
         "-metadata", f"title=Fact_{unique_id}",
         "-metadata", f"comment=UID_{unique_id}",
@@ -298,11 +242,142 @@ def make_video_fully_unique(input_video: str, output_video: str):
         "-metadata", f"creation_time={now_iso}",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", crf_val,
         "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", random.choice(["160k", "192k"]),
         "-movflags", "+faststart",
         output_video
     ]
     subprocess.run(cmd, check=True)
+
+
+# ==========================================
+# STEP 4: FINAL RANDOM BACKGROUND MUSIC (music.txt)
+# (Sabhi work ke baad final video mein add hoga)
+# ==========================================
+def extract_drive_id(url: str):
+    patterns = [
+        r"/file/d/([a-zA-Z0-9_-]+)",
+        r"[?&]id=([a-zA-Z0-9_-]+)",
+        r"/uc\?.*id=([a-zA-Z0-9_-]+)"
+    ]
+    for pat in patterns:
+        m = re.search(pat, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+def download_valid_music(work_dir: Path):
+    if not MUSIC_FILE.exists():
+        print("    [WARN] music.txt file nahi mili!", flush=True)
+        return None
+
+    links = [
+        line.strip() for line in MUSIC_FILE.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not links:
+        print("    [WARN] music.txt khali hai!", flush=True)
+        return None
+
+    random.shuffle(links)
+
+    for idx, url in enumerate(links):
+        music_path = str(work_dir / f"bg_music_{idx}_{int(time.time())}.audio")
+        print(f"    -> Trying music link ({idx + 1}/{len(links)}): {url}", flush=True)
+
+        # Method 1: gdown (best for Google Drive links)
+        try:
+            file_id = extract_drive_id(url)
+            if file_id:
+                gdown.download(id=file_id, output=music_path, quiet=True)
+            else:
+                gdown.download(url=url, output=music_path, quiet=True, fuzzy=True)
+        except Exception as e:
+            print(f"    -> gdown failed: {e}", flush=True)
+
+        # Verify ki valid audio file hi download hui hai (HTML page nahi)
+        if os.path.exists(music_path) and has_audio_stream(music_path):
+            print("    [OK] Valid music file downloaded via gdown.", flush=True)
+            return music_path
+
+        # Method 2: Direct requests fallback
+        try:
+            direct_url = url
+            file_id = extract_drive_id(url)
+            if file_id:
+                direct_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+            r = requests.get(direct_url, timeout=60, allow_redirects=True)
+            if r.status_code == 200 and len(r.content) > 5000:
+                with open(music_path, "wb") as f:
+                    f.write(r.content)
+                if has_audio_stream(music_path):
+                    print("    [OK] Valid music file downloaded via direct request.", flush=True)
+                    return music_path
+        except Exception as e:
+            print(f"    -> Direct download failed: {e}", flush=True)
+
+        print("    [FAIL] Invalid audio or private Drive link, next link try kar rahe hain...", flush=True)
+
+    return None
+
+
+def add_final_bg_music(input_video: str, output_video: str, work_dir: Path):
+    if not ADD_BG_MUSIC:
+        shutil.copy(input_video, output_video)
+        return
+
+    music_path = download_valid_music(work_dir)
+    if not music_path:
+        print("    [WARN] Koi bhi music download nahi ho paya, bina music ke aage badh rahe hain.", flush=True)
+        shutil.copy(input_video, output_video)
+        return
+
+    unique_id = uuid.uuid4().hex[:12]
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+    chosen_encoder = random.choice(["Apple iPhone 15 Pro", "Samsung Galaxy S24", "Google Pixel 9", "Sony Alpha ZV-E10"])
+
+    # Auto-repeat (-stream_loop -1) agar music chhota hai, Auto-trim (-shortest) agar music bada hai
+    if has_audio_stream(input_video):
+        filter_complex = (
+            f"[0:a]volume=0.75[a0];"
+            f"[1:a]volume={BG_MUSIC_VOLUME}[a1];"
+            f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]"
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", input_video,
+            "-stream_loop", "-1", "-i", music_path,
+            "-filter_complex", filter_complex,
+            "-map", "0:v:0", "-map", "[aout]",
+            "-map_metadata", "-1",
+            "-metadata", f"title=Fact_{unique_id}",
+            "-metadata", f"comment=UID_{unique_id}",
+            "-metadata", f"encoder={chosen_encoder}",
+            "-metadata", f"creation_time={now_iso}",
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-shortest", "-movflags", "+faststart",
+            output_video
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", input_video,
+            "-stream_loop", "-1", "-i", music_path,
+            "-filter_complex", f"[1:a]volume={BG_MUSIC_VOLUME}[aout]",
+            "-map", "0:v:0", "-map", "[aout]",
+            "-map_metadata", "-1",
+            "-metadata", f"title=Fact_{unique_id}",
+            "-metadata", f"comment=UID_{unique_id}",
+            "-metadata", f"encoder={chosen_encoder}",
+            "-metadata", f"creation_time={now_iso}",
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-shortest", "-movflags", "+faststart",
+            output_video
+        ]
+
+    subprocess.run(cmd, check=True)
+    print("    [SUCCESS] Background music merged into final video!", flush=True)
 
 
 # ==========================================
@@ -476,7 +551,6 @@ def cleanup_old_videos(folder: Path, max_days: int = AUTO_DELETE_DAYS):
         if not f.is_file() or f.suffix.lower() not in VIDEO_EXTS:
             continue
         try:
-            # Git commit timestamp check (checkout se mtime reset ho jata hai)
             out = subprocess.check_output(
                 ["git", "log", "-1", "--format=%ct", "--", str(f)]
             ).decode().strip()
@@ -494,7 +568,6 @@ def cleanup_old_videos(folder: Path, max_days: int = AUTO_DELETE_DAYS):
 # MAIN BATCH RUNNER
 # ==========================================
 def process_all_videos():
-    # Pehle 30 din purane videos auto-delete karein
     cleanup_old_videos(DONE_DIR, AUTO_DELETE_DAYS)
 
     videos = [
@@ -513,12 +586,11 @@ def process_all_videos():
                 print(f"  [SKIP] {video_file.name} is {duration:.1f}s (2 min limit se zyada).", flush=True)
                 continue
 
-            # Koi local output folder nahi banega — sab temp folder mein process hoga
             with tempfile.TemporaryDirectory() as tmp:
                 work_dir = Path(tmp)
                 step1 = str(work_dir / "s1_nocap.mp4")
                 step2 = str(work_dir / "s2_noaudio.mp4")
-                step3 = str(work_dir / "s3_music.mp4")
+                step3 = str(work_dir / "s3_unique.mp4")
                 unique_tag = uuid.uuid4().hex[:6]
                 final_name = f"{video_file.stem}_{unique_tag}.mp4"
                 final_out = str(work_dir / final_name)
@@ -529,20 +601,19 @@ def process_all_videos():
                 print(f"  [2/6] Removing background voiceover/noise ({AUDIO_MODE})...", flush=True)
                 clean_audio(step1, step2, work_dir)
 
-                print("  [3/6] Adding random background music from music.txt...", flush=True)
-                add_random_bg_music(step2, step3, work_dir)
+                print("  [3/6] Applying unique metadata, hash, fingerprint, pixel & audio tweaks...", flush=True)
+                make_video_fully_unique(step2, step3)
 
-                print("  [4/6] Applying unique metadata, hash, fingerprint, pixel & audio tweaks...", flush=True)
-                make_video_fully_unique(step3, final_out)
+                print("  [4/6] Adding final random background music from music.txt...", flush=True)
+                add_final_bg_music(step3, final_out, work_dir)
 
-                print(f"  [5/6] Pushing video file directly to {TARGET_REPO}...", flush=True)
+                print(f"  [5/6] Pushing final video file directly to {TARGET_REPO}...", flush=True)
                 target_path = push_video_to_target_repo(final_out, final_name)
 
                 print("  [6/6] Uploading with 12-server fallback...", flush=True)
                 server_name, direct_link = upload_with_fallback(final_out)
                 save_link_to_csv(video_file.name, server_name, direct_link, target_path)
 
-            # Original video ko done_originals mein move karein (30 din baad auto-delete hoga)
             shutil.move(str(video_file), str(DONE_DIR / video_file.name))
             print(f"<<< DONE: {video_file.name} -> {target_path}", flush=True)
 
