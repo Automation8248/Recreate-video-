@@ -1,6 +1,7 @@
 import os
 import re
 import csv
+import json
 import time
 import uuid
 import random
@@ -22,8 +23,8 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # CONFIGURATION (ALL OPTIONS KEPT INTACT)
 # ==========================================
 INPUT_DIR = Path("videos")
-DONE_DIR = Path("done_originals")
 MUSIC_FILE = Path("music.txt")
+COOLING_FILE = Path("cooling_history.json")
 LINKS_CSV = Path("output_links.csv")
 
 # Target Repo Settings (Final video file yahan save hogi)
@@ -33,21 +34,64 @@ TARGET_SUBFOLDER = "Facebook Intresting Fact/Videos"
 GH_TOKEN = os.environ.get("GH_TOKEN", "").strip()
 
 MAX_DURATION_SEC = 125          # 2 minute max (+5s buffer)
-AUTO_DELETE_DAYS = 30           # 30 days baad processed videos auto-delete
+COOLING_DAYS = 30               # 30 days cooling -> phir automatic delete
 REMOVE_BURNED_CAPTIONS = True   # Zero-leak 2-pass auto-caption removal
-AUDIO_MODE = "no_vocals"        # 'no_vocals' (voiceover hataye), 'deepfilter' (bg noise hataye), 'keep_vocals' (music hataye)
+MUTE_ORIGINAL_AUDIO = True      # True = Original audio 100% mute (best for copyright bypass)
+AUDIO_MODE = "no_vocals"        # Sirf tab use hoga jab MUTE_ORIGINAL_AUDIO = False ho
 ADD_BG_MUSIC = True             # music.txt se random Drive music add karega
-BG_MUSIC_VOLUME = 0.45          # Clear audible background music volume (0.1 to 1.0)
+BG_MUSIC_VOLUME = 0.80          # Fresh music volume (0.1 to 1.0)
 ENABLE_SERVER_UPLOAD = True     # 12-server fallback uploader option
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 
-for d in (INPUT_DIR, DONE_DIR):
-    d.mkdir(exist_ok=True)
+INPUT_DIR.mkdir(exist_ok=True)
 
 OCR_READER = None
 if REMOVE_BURNED_CAPTIONS:
     import easyocr
     OCR_READER = easyocr.Reader(["en"], gpu=False, quantize=False)
+
+
+# ==========================================
+# COOLING & 30-DAY AUTO-DELETE MANAGER
+# ==========================================
+def load_cooling_history() -> dict:
+    if COOLING_FILE.exists():
+        try:
+            return json.loads(COOLING_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def save_cooling_history(history: dict):
+    COOLING_FILE.write_text(json.dumps(history, indent=2), encoding="utf-8")
+
+
+def cleanup_expired_videos(history: dict) -> dict:
+    """
+    Jin videos ka 30 days cooling complete ho gaya hai,
+    unhe videos/ folder se automatically delete karega.
+    """
+    now_ts = time.time()
+    cutoff_sec = COOLING_DAYS * 86400
+    updated = {}
+
+    for filename, used_ts in history.items():
+        age_sec = now_ts - float(used_ts)
+        age_days = age_sec / 86400
+        video_path = INPUT_DIR / filename
+
+        if age_sec >= cutoff_sec:
+            if video_path.exists():
+                video_path.unlink()
+                print(f"[AUTO-DELETE] {filename} ({age_days:.1f} days complete) deleted from videos/.", flush=True)
+            else:
+                print(f"[CLEANUP] {filename} already removed, clearing from cooling log.", flush=True)
+        else:
+            updated[filename] = used_ts
+
+    save_cooling_history(updated)
+    return updated
 
 
 # ==========================================
@@ -156,10 +200,10 @@ def remove_shorts_captions(input_video: str, output_video: str, work_dir: Path):
 
 
 # ==========================================
-# STEP 2: REMOVE BACKGROUND VOICEOVER / NOISE
+# STEP 2: OPTIONAL AUDIO CLEAN (IF NOT MUTED)
 # ==========================================
 def clean_audio(input_video: str, output_video: str, work_dir: Path, mode: str = AUDIO_MODE):
-    if not has_audio_stream(input_video):
+    if MUTE_ORIGINAL_AUDIO or not has_audio_stream(input_video):
         shutil.copy(input_video, output_video)
         return
 
@@ -190,49 +234,47 @@ def clean_audio(input_video: str, output_video: str, work_dir: Path, mode: str =
 
 
 # ==========================================
-# STEP 3: DEEP UNIQUENESS (METADATA, HASH, FINGERPRINT, PIXELS, AUDIO)
+# STEP 3: STRONG COPYRIGHT & FINGERPRINT BYPASS
+# (Flip + 8-12% Zoom + 1.07x Speed + Blurred Frame + Trim + Fresh Metadata/Hash)
 # ==========================================
 def make_video_fully_unique(input_video: str, output_video: str):
-    zoom = round(random.uniform(1.015, 1.030), 4)
-    angle_rad = round(random.uniform(-0.005, 0.005), 4)
-    brightness = round(random.uniform(-0.025, 0.025), 3)
-    contrast = round(random.uniform(0.97, 1.04), 3)
-    saturation = round(random.uniform(0.97, 1.05), 3)
-    gamma = round(random.uniform(0.98, 1.03), 3)
-    hue_shift = round(random.uniform(-2.0, 2.0), 2)
-    noise_str = random.choice([2, 3])
-    speed = round(random.uniform(1.005, 1.022), 4)
+    duration = get_duration(input_video)
+    trim_start = 1.5 if duration > 10 else 0.0
+    trim_end = max(duration - 1.5, trim_start + 3.0) if duration > 10 else duration
+
+    zoom = round(random.uniform(1.08, 1.12), 3)
+    brightness = round(random.uniform(-0.04, 0.04), 3)
+    contrast = round(random.uniform(1.03, 1.09), 3)
+    saturation = round(random.uniform(1.04, 1.12), 3)
+    hue_shift = round(random.uniform(-5.0, 5.0), 2)
+    speed = round(random.uniform(1.07, 1.10), 3)
     pts_factor = round(1.0 / speed, 5)
-    crf_val = str(random.choice([20, 21, 22]))
+    crf_val = str(random.choice([21, 22, 23]))
 
-    vf_chain = (
-        f"scale=iw*{zoom}:ih*{zoom},"
-        f"rotate={angle_rad}:fillcolor=black@0,"
-        f"crop=iw/{zoom}:ih/{zoom},"
-        f"eq=brightness={brightness}:contrast={contrast}:saturation={saturation}:gamma={gamma},"
-        f"hue=h={hue_shift},"
-        f"noise=alls={noise_str}:allf=t+u,"
-        f"setpts={pts_factor}*PTS"
+    filter_complex = (
+        f"[0:v]trim=start={trim_start}:end={trim_end},setpts=PTS-STARTPTS,"
+        f"hflip,scale=iw*{zoom}:ih*{zoom},crop=iw/{zoom}:ih/{zoom},"
+        f"eq=brightness={brightness}:contrast={contrast}:saturation={saturation},"
+        f"hue=h={hue_shift},noise=alls=4:allf=t+u,setpts={pts_factor}*PTS,split=2[bg][fg];"
+        f"[bg]boxblur=20:5[bg_blur];"
+        f"[fg]scale=iw*0.88:ih*0.88[fg_small];"
+        f"[bg_blur][fg_small]overlay=(W-w)/2:(H-h)/2[vout]"
     )
-
-    cmd = ["ffmpeg", "-y", "-i", input_video, "-vf", vf_chain]
-
-    if has_audio_stream(input_video):
-        pitch = round(random.uniform(0.985, 1.015), 4)
-        tempo_adj = round(speed / pitch, 4)
-        bass_gain = round(random.uniform(-1.2, 1.5), 2)
-        af_chain = (
-            f"asetrate=48000*{pitch},aresample=48000,"
-            f"atempo={tempo_adj},"
-            f"bass=g={bass_gain}"
-        )
-        cmd += ["-af", af_chain, "-c:a", "aac", "-b:a", "192k"]
-    else:
-        cmd += ["-an"]
 
     unique_id = uuid.uuid4().hex[:12]
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
     chosen_encoder = random.choice(["Apple iPhone 15 Pro", "Samsung Galaxy S24", "Google Pixel 9", "Sony Alpha ZV-E10"])
+
+    cmd = [
+        "ffmpeg", "-y", "-i", input_video,
+        "-filter_complex", filter_complex,
+        "-map", "[vout]",
+    ]
+
+    if MUTE_ORIGINAL_AUDIO or not has_audio_stream(input_video):
+        cmd += ["-an"]
+    else:
+        cmd += ["-map", "0:a:0", "-af", f"atempo={speed}", "-c:a", "aac", "-b:a", "192k"]
 
     cmd += [
         "-map_metadata", "-1",
@@ -250,7 +292,6 @@ def make_video_fully_unique(input_video: str, output_video: str):
 
 # ==========================================
 # STEP 4: FINAL RANDOM BACKGROUND MUSIC (music.txt)
-# (Sabhi work ke baad final video mein add hoga)
 # ==========================================
 def extract_drive_id(url: str):
     patterns = [
@@ -284,7 +325,6 @@ def download_valid_music(work_dir: Path):
         music_path = str(work_dir / f"bg_music_{idx}_{int(time.time())}.audio")
         print(f"    -> Trying music link ({idx + 1}/{len(links)}): {url}", flush=True)
 
-        # Method 1: gdown (best for Google Drive links)
         try:
             file_id = extract_drive_id(url)
             if file_id:
@@ -294,12 +334,10 @@ def download_valid_music(work_dir: Path):
         except Exception as e:
             print(f"    -> gdown failed: {e}", flush=True)
 
-        # Verify ki valid audio file hi download hui hai (HTML page nahi)
         if os.path.exists(music_path) and has_audio_stream(music_path):
             print("    [OK] Valid music file downloaded via gdown.", flush=True)
             return music_path
 
-        # Method 2: Direct requests fallback
         try:
             direct_url = url
             file_id = extract_drive_id(url)
@@ -331,6 +369,7 @@ def add_final_bg_music(input_video: str, output_video: str, work_dir: Path):
         shutil.copy(input_video, output_video)
         return
 
+    pitch = round(random.uniform(0.98, 1.02), 3)
     unique_id = uuid.uuid4().hex[:12]
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
     chosen_encoder = random.choice(["Apple iPhone 15 Pro", "Samsung Galaxy S24", "Google Pixel 9", "Sony Alpha ZV-E10"])
@@ -338,46 +377,31 @@ def add_final_bg_music(input_video: str, output_video: str, work_dir: Path):
     # Auto-repeat (-stream_loop -1) agar music chhota hai, Auto-trim (-shortest) agar music bada hai
     if has_audio_stream(input_video):
         filter_complex = (
-            f"[0:a]volume=0.75[a0];"
-            f"[1:a]volume={BG_MUSIC_VOLUME}[a1];"
+            f"[0:a]volume=0.70[a0];"
+            f"[1:a]asetrate=48000*{pitch},aresample=48000,volume={BG_MUSIC_VOLUME}[a1];"
             f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]"
         )
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", input_video,
-            "-stream_loop", "-1", "-i", music_path,
-            "-filter_complex", filter_complex,
-            "-map", "0:v:0", "-map", "[aout]",
-            "-map_metadata", "-1",
-            "-metadata", f"title=Fact_{unique_id}",
-            "-metadata", f"comment=UID_{unique_id}",
-            "-metadata", f"encoder={chosen_encoder}",
-            "-metadata", f"creation_time={now_iso}",
-            "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-            "-shortest", "-movflags", "+faststart",
-            output_video
-        ]
     else:
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", input_video,
-            "-stream_loop", "-1", "-i", music_path,
-            "-filter_complex", f"[1:a]volume={BG_MUSIC_VOLUME}[aout]",
-            "-map", "0:v:0", "-map", "[aout]",
-            "-map_metadata", "-1",
-            "-metadata", f"title=Fact_{unique_id}",
-            "-metadata", f"comment=UID_{unique_id}",
-            "-metadata", f"encoder={chosen_encoder}",
-            "-metadata", f"creation_time={now_iso}",
-            "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-            "-shortest", "-movflags", "+faststart",
-            output_video
-        ]
+        filter_complex = f"[1:a]asetrate=48000*{pitch},aresample=48000,volume={BG_MUSIC_VOLUME}[aout]"
 
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_video,
+        "-stream_loop", "-1", "-i", music_path,
+        "-filter_complex", filter_complex,
+        "-map", "0:v:0", "-map", "[aout]",
+        "-map_metadata", "-1",
+        "-metadata", f"title=Fact_{unique_id}",
+        "-metadata", f"comment=UID_{unique_id}",
+        "-metadata", f"encoder={chosen_encoder}",
+        "-metadata", f"creation_time={now_iso}",
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-shortest", "-movflags", "+faststart",
+        output_video
+    ]
     subprocess.run(cmd, check=True)
-    print("    [SUCCESS] Background music merged into final video!", flush=True)
+    print("    [SUCCESS] Fresh copyright-free music merged into final video!", flush=True)
 
 
 # ==========================================
@@ -538,44 +562,23 @@ def push_video_to_target_repo(video_path: str, output_filename: str) -> str:
 
 
 # ==========================================
-# STEP 7: 30-DAY AUTO-DELETE (SOURCE DONE_ORIGINALS)
-# ==========================================
-def cleanup_old_videos(folder: Path, max_days: int = AUTO_DELETE_DAYS):
-    if not folder.exists():
-        return
-
-    now_ts = time.time()
-    cutoff_sec = max_days * 86400
-
-    for f in folder.iterdir():
-        if not f.is_file() or f.suffix.lower() not in VIDEO_EXTS:
-            continue
-        try:
-            out = subprocess.check_output(
-                ["git", "log", "-1", "--format=%ct", "--", str(f)]
-            ).decode().strip()
-            file_ts = int(out) if out else int(f.stat().st_mtime)
-        except Exception:
-            file_ts = int(f.stat().st_mtime)
-
-        age_days = (now_ts - file_ts) / 86400
-        if (now_ts - file_ts) >= cutoff_sec:
-            print(f"[AUTO-DELETE] {f.name} ({age_days:.1f} days old) deleted.", flush=True)
-            f.unlink()
-
-
-# ==========================================
 # MAIN BATCH RUNNER
 # ==========================================
 def process_all_videos():
-    cleanup_old_videos(DONE_DIR, AUTO_DELETE_DAYS)
+    # 1. Load cooling log & delete 30+ days old videos
+    cooling_history = load_cooling_history()
+    cooling_history = cleanup_expired_videos(cooling_history)
 
+    # 2. Pick only NEW videos (jo cooling_history mein nahi hain)
     videos = [
         p for p in INPUT_DIR.iterdir()
-        if p.is_file() and p.suffix.lower() in VIDEO_EXTS
+        if p.is_file()
+        and p.suffix.lower() in VIDEO_EXTS
+        and p.name not in cooling_history
     ]
+
     if not videos:
-        print("No valid video files found in videos/. Exiting.", flush=True)
+        print("No new videos to process (all are either done or in 30-day cooling).", flush=True)
         return
 
     for video_file in videos:
@@ -589,7 +592,7 @@ def process_all_videos():
             with tempfile.TemporaryDirectory() as tmp:
                 work_dir = Path(tmp)
                 step1 = str(work_dir / "s1_nocap.mp4")
-                step2 = str(work_dir / "s2_noaudio.mp4")
+                step2 = str(work_dir / "s2_audio.mp4")
                 step3 = str(work_dir / "s3_unique.mp4")
                 unique_tag = uuid.uuid4().hex[:6]
                 final_name = f"{video_file.stem}_{unique_tag}.mp4"
@@ -598,13 +601,13 @@ def process_all_videos():
                 print("  [1/6] Removing auto-captions (Zero-Leak 2-Pass)...", flush=True)
                 remove_shorts_captions(str(video_file), step1, work_dir)
 
-                print(f"  [2/6] Removing background voiceover/noise ({AUDIO_MODE})...", flush=True)
+                print("  [2/6] Handling original audio...", flush=True)
                 clean_audio(step1, step2, work_dir)
 
-                print("  [3/6] Applying unique metadata, hash, fingerprint, pixel & audio tweaks...", flush=True)
+                print("  [3/6] Applying strong copyright & visual fingerprint bypass...", flush=True)
                 make_video_fully_unique(step2, step3)
 
-                print("  [4/6] Adding final random background music from music.txt...", flush=True)
+                print("  [4/6] Adding final random copyright-free music from music.txt...", flush=True)
                 add_final_bg_music(step3, final_out, work_dir)
 
                 print(f"  [5/6] Pushing final video file directly to {TARGET_REPO}...", flush=True)
@@ -614,8 +617,10 @@ def process_all_videos():
                 server_name, direct_link = upload_with_fallback(final_out)
                 save_link_to_csv(video_file.name, server_name, direct_link, target_path)
 
-            shutil.move(str(video_file), str(DONE_DIR / video_file.name))
-            print(f"<<< DONE: {video_file.name} -> {target_path}", flush=True)
+            # Video ko turant delete nahi karega — 30-day cooling log mein daal dega
+            cooling_history[video_file.name] = time.time()
+            save_cooling_history(cooling_history)
+            print(f"<<< DONE: {video_file.name} (30-day cooling started) -> {target_path}", flush=True)
 
         except Exception as e:
             print(f"[ERROR] Failed on {video_file.name}: {e}", flush=True)
