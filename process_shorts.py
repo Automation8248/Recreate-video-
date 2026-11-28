@@ -234,61 +234,78 @@ def clean_audio(input_video: str, output_video: str, work_dir: Path, mode: str =
 
 
 # ==========================================
-# STEP 3: STRONG COPYRIGHT & FINGERPRINT BYPASS
-# (Flip + 8-12% Zoom + 1.07x Speed + Blurred Frame + Trim + Fresh Metadata/Hash)
+# STEP 3: EXTREME CONTENT ID, PIXEL (200->201) & METADATA BYPASS
 # ==========================================
 def make_video_fully_unique(input_video: str, output_video: str):
     duration = get_duration(input_video)
+
+    # 1. Temporal Micro Jump-Cuts (har 3.5 sec par 0.3 sec cut -> Content ID timeline break)
     trim_start = 1.5 if duration > 10 else 0.0
     trim_end = max(duration - 1.5, trim_start + 3.0) if duration > 10 else duration
 
-    zoom = round(random.uniform(1.08, 1.12), 3)
+    # 2. Exact Pixel RGB Channel Shift (e.g., 200 -> 201/202/198)
+    r_shift = random.choice([-3, -2, 2, 3])
+    g_shift = random.choice([-2, -1, 1, 2])
+    b_shift = random.choice([-3, -2, 2, 3])
+
+    # 3. Color, Speed, Zoom & Quality Randomization
+    zoom = round(random.uniform(1.10, 1.14), 3)
     brightness = round(random.uniform(-0.04, 0.04), 3)
-    contrast = round(random.uniform(1.03, 1.09), 3)
-    saturation = round(random.uniform(1.04, 1.12), 3)
-    hue_shift = round(random.uniform(-5.0, 5.0), 2)
-    speed = round(random.uniform(1.07, 1.10), 3)
+    contrast = round(random.uniform(1.04, 1.10), 3)
+    saturation = round(random.uniform(1.05, 1.14), 3)
+    hue_shift = round(random.uniform(-6.0, 6.0), 2)
+    speed = round(random.uniform(1.08, 1.12), 3)
     pts_factor = round(1.0 / speed, 5)
     crf_val = str(random.choice([21, 22, 23]))
 
+    # Jump-cut select expression: har 3.5 sec mein 0.3 sec drop karega
+    jump_cut_expr = "lt(mod(t,3.5),3.2)"
+
+    # Dynamic crop + RGB pixel shift + Blurred Frame + Vignette + Animated Progress Bar
     filter_complex = (
         f"[0:v]trim=start={trim_start}:end={trim_end},setpts=PTS-STARTPTS,"
-        f"hflip,scale=iw*{zoom}:ih*{zoom},crop=iw/{zoom}:ih/{zoom},"
+        f"select='{jump_cut_expr}',setpts=N/FRAME_RATE/TB,"
+        f"hflip,"
+        f"lutrgb=r='clip(val+{r_shift},0,255)':g='clip(val+{g_shift},0,255)':b='clip(val+{b_shift},0,255)',"
+        f"scale=iw*{zoom}:ih*{zoom},"
+        f"crop=iw/{zoom}:ih/{zoom}:x='(iw-ow)/2+sin(t*1.5)*6':y='(ih-oh)/2+cos(t*1.2)*6',"
         f"eq=brightness={brightness}:contrast={contrast}:saturation={saturation},"
-        f"hue=h={hue_shift},noise=alls=4:allf=t+u,setpts={pts_factor}*PTS,split=2[bg][fg];"
-        f"[bg]boxblur=20:5[bg_blur];"
-        f"[fg]scale=iw*0.88:ih*0.88[fg_small];"
-        f"[bg_blur][fg_small]overlay=(W-w)/2:(H-h)/2[vout]"
+        f"hue=h={hue_shift},noise=alls=5:allf=t+u,vignette=PI/5,"
+        f"setpts={pts_factor}*PTS,split=2[bg][fg];"
+        f"[bg]boxblur=22:6[bg_blur];"
+        f"[fg]scale=iw*0.86:ih*0.86[fg_small];"
+        f"[bg_blur][fg_small]overlay=(W-w)/2:(H-h)/2,"
+        f"drawbox=x=0:y=ih-8:w='iw*(t/{max(trim_end-trim_start,1)})':h=8:color=white@0.85:t=fill[vout]"
     )
 
-    unique_id = uuid.uuid4().hex[:12]
+    # 4. Complete Metadata Wipe + Fresh Unique Container Tags
+    unique_id = uuid.uuid4().hex[:14]
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
-    chosen_encoder = random.choice(["Apple iPhone 15 Pro", "Samsung Galaxy S24", "Google Pixel 9", "Sony Alpha ZV-E10"])
+    chosen_encoder = random.choice([
+        "Apple iPhone 16 Pro",
+        "Samsung Galaxy S25 Ultra",
+        "Google Pixel 9 Pro",
+        "Sony Alpha ZV-E10"
+    ])
 
     cmd = [
         "ffmpeg", "-y", "-i", input_video,
         "-filter_complex", filter_complex,
         "-map", "[vout]",
-    ]
-
-    if MUTE_ORIGINAL_AUDIO or not has_audio_stream(input_video):
-        cmd += ["-an"]
-    else:
-        cmd += ["-map", "0:a:0", "-af", f"atempo={speed}", "-c:a", "aac", "-b:a", "192k"]
-
-    cmd += [
+        "-an",  # Original audio 100% MUTE (sirf music.txt ka fresh audio lagega)
         "-map_metadata", "-1",
+        "-map_chapters", "-1",
         "-metadata", f"title=Fact_{unique_id}",
         "-metadata", f"comment=UID_{unique_id}",
         "-metadata", f"encoder={chosen_encoder}",
         "-metadata", f"creation_time={now_iso}",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", crf_val,
         "-pix_fmt", "yuv420p",
+        "-r", "30",  # Frame rate standardize (jump-cuts smooth rakhne ke liye)
         "-movflags", "+faststart",
         output_video
     ]
     subprocess.run(cmd, check=True)
-
 
 # ==========================================
 # STEP 4: FINAL RANDOM BACKGROUND MUSIC (music.txt)
